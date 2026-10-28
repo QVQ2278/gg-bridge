@@ -1,4 +1,5 @@
 node_modules/
 config.json
+.affect-state.json
 *.log
 .DS_Store

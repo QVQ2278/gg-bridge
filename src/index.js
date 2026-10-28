@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { ConsoleAdapter } from './adapters/console.js';
 import { OneBotAdapter } from './adapters/onebot.js';
 import { DshClient } from './dsh/client.js';
+import { AffectStore } from './persona/affect.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -24,7 +25,9 @@ function loadConfig() {
   const example = path.join(ROOT, 'config.example.json');
   const file = fs.existsSync(real) ? real : example;
   if (!fs.existsSync(file)) throw new Error('找不到 config.json，也没有 config.example.json');
-  return { file, data: JSON.parse(fs.readFileSync(file, 'utf8')) };
+  // Windows 记事本/Set-Content 会塞 BOM，JSON.parse 见到 \uFEFF 会直接炸
+  const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+  return { file, data: JSON.parse(raw) };
 }
 
 const ADAPTERS = {
@@ -49,6 +52,10 @@ async function main() {
     workspacePath: data.dsh?.workspacePath || process.cwd(),
   });
   const adapter = createAdapter(data.adapter?.type ?? 'console', data.adapter ?? {});
+  const affect = new AffectStore({
+    file: path.join(ROOT, '.affect-state.json'),
+    config: data.persona ?? {},
+  });
   console.log(`[gg-bridge] DSH：${dsh.baseUrl}`);
 
   const ctxByKey = new Map();      // 会话键 -> 最近一次的 ctx（用来把审批/提问发回去）
@@ -121,10 +128,18 @@ async function main() {
       return;
     }
 
+    // 调试用：看一眼当前情绪档案
+    if (text.trim() === '/情绪') {
+      await adapter.send(ctx, affect.statusText(key));
+      return;
+    }
+
     try {
       const started = Date.now();
       console.log(`[${key}] ← ${text.slice(0, 60)}`);
-      const reply = await dsh.prompt(ctx, text);
+      const mood = affect.promptFor(key);
+      const reply = await dsh.prompt(ctx, mood ? `${mood}\n\n${text}` : text);
+      affect.updateTurn(key, text);
       console.log(`[${key}] → ${(reply ?? '').slice(0, 60)} (${Date.now() - started}ms)`);
       if (reply) await adapter.send(ctx, reply);
       else await adapter.send(ctx, '（这回合没说话）');
