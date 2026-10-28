@@ -40,8 +40,14 @@ async function main() {
   const { file, data } = loadConfig();
   console.log(`[gg-bridge] 配置：${path.relative(ROOT, file)}`);
 
-  const dsh = new DshClient(data.dsh ?? {});
+  const dsh = new DshClient({
+    ...(data.dsh ?? {}),
+    // 会话都挂在这个工作区下；留空就用桥自己的目录
+    workspacePath: data.dsh?.workspacePath || process.cwd(),
+  });
   const adapter = createAdapter(data.adapter?.type ?? 'console', data.adapter ?? {});
+
+  console.log(`[gg-bridge] DSH：${dsh.baseUrl}`);
 
   // 平台消息 → DSH 回合 → 回复发回去。
   // 一个事件处理不完不影响下一句，所以逐个 await，但出错只记日志。

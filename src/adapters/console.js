@@ -36,7 +36,7 @@ export class ConsoleAdapter extends BaseAdapter {
   /** 回复打印到终端，然后重新给提示符。 */
   async send(ctx, text) {
     process.stdout.write(`\n鱼 > ${text}\n\n`);
-    this.rl?.prompt();
+    if (this.rl && !this.rl.closed) this.rl.prompt();
   }
 
   async disconnect() {

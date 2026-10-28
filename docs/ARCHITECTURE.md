@@ -1,48 +1,108 @@
-# 架构与移植清单
+# 架构与协议备忘
 
 ## 两条边
 
 ```
   聊天平台  <--适配器-->  gg-bridge  <--DSH 客户端-->  DeepSeek Harness
- (QQ/群/…)   base.js                     dsh/client.js
+ (QQ/OneBot)  base.js                   dsh/client.js
 ```
 
-适配器只认「文本 + 上下文」，DSH 客户端只认「一个回合进、一段回复出」。
-中间这一层不存业务状态，状态都在两端各自的进程里。
+适配器只认「文本 + 上下文」，DSH 客户端只认「一句话进、一段话出」。
+中间不存业务状态：会话 id 在客户端里按 ctx 缓存，消息本身不落盘。
 
 ## 槽位
 
-| 槽位 | 现状 | 要做什么 |
-|---|---|---|
-| `src/adapters/base.js` | 接口已定 | 不用改 |
-| `src/adapters/console.js` | 可跑 | 拿它验证链路 |
-| `src/adapters/onebot.js` | 可跑 | QQ / OneBot v11，接 NapCat 之类 |
-| `src/dsh/client.js` | 只有签名 | 移植鉴权 + RPC + 事件流 |
+| 槽位 | 现状 |
+|---|---|
+| `src/adapters/base.js` | 接口（connect / send / emit('message')） |
+| `src/adapters/onebot.js` | ✅ QQ，OneBot v11 正向 WebSocket |
+| `src/adapters/console.js` | ✅ 终端 |
+| `src/dsh/client.js` | ✅ Cookie 铸造、单元 RPC、回合 |
+| `src/dsh/ws.js` | ✅ 手写 WebSocket（带 Cookie 头） |
+| `scripts/test-*.mjs` | ✅ 16 项本地测试 |
 
-## DSH 侧要点（照 qq-bridge 抄，别自己发明）
+## DSH 侧：实测出来的协议
 
-1. **Cookie 鉴权**。`dsh-auth-` 前缀 + `base64url(sha256(authority))`，payload 里
-   `authority` 必须等于请求的 Host 头；用 `~/.dsh` 的 `client-connection/browser-session`
-   密钥做 HMAC 签名。签名密钥不可用时才回退到进程启动 token。
-2. **斜杠 RPC**，参数包在 `{ args: {...} }`。`session/prompt` 必带 `requestId`。
-3. **`/api/remote.mux`**：先 `session/follow` 开流，再发 `session/prompt`；
-   文本增量、工具调用、**提问与审批**都从这条流里出。
-4. **审批**：DSH 的审批请求走 mux 上的 `$events`，要用 `$events/result` 回。桥如果不应答，
-   回合会永远卡住——这是最容易踩的坑。
-5. **会话退役**：换会话前要清掉 DSH 侧未执行的队列，读队列以 `session/projections`
-   为主路径。qq-bridge 在这里踩过 P0（读了一个不存在的字段，导致每次退役都抛错）。
+### 1. Cookie 鉴权
+
+```
+name  = 'dsh-auth-' + base64url(sha256(authority))
+value = 'v1.' + base64url({version:1, authority, issuedAt, expiresAt}) + '.' + base64url(hmac_sha256(secret, payload))
+```
+
+- `authority` = `Host` 头，例如 `127.0.0.1:65296`（**端口也算**，换端口要重新铸造）
+- `secret` = `~/.dsh/.credentials.yaml` → `records['client-connection/browser-session'].payload.secret`，
+  32 字节，base64url
+- 有效期别超过 30 天（默认上限）；这里给 1 小时，401 时自动重铸
+
+进程启动 token（`?token=`）是另一条路，但它只在内存里、只在启动器把 stdout 记到日志时才找得到，
+所以不作为主路径。
+
+### 2. 单元 RPC
+
+```
+POST /api/session/prompt
+cookie: <上面那串>
+
+{ "type": "client-request", "rpcId": "<uuid>", "method": "session/prompt",
+  "payload": { "args": { "request": { ... } } } }
+```
+
+回包 `{type:'server-response', rpcId, result:{ok:true, value}}`，失败是 `result.error.{code,message}`。
+
+参数位置：多数 `args.request`，`session/list` 是 `args._request`，`agentPresets/list`、`settings/describe`
+直接 `args:{}`。`session/prompt` 必须带 `requestId`。
+
+### 3. 事件流 `/api/remote.mux`
+
+WebSocket，握手要带 `Cookie` 头。开流：
+
+```json
+{ "type": "open", "streamId": "<uuid>", "endpoint": "session/follow",
+  "payload": { "args": { "request": { "address": { "kind": "session", "sessionId": "..." }, "maxMessages": 1 } } } }
+```
+
+下行帧：
+
+| 帧 | 含义 |
+|---|---|
+| `{type:'item', value:{type:'snapshot'}}` | 开场快照（含历史，**别把里面的旧 turn/end 当新回合**） |
+| `{type:'item', value:{type:'event', event}}` | 回合事件：`turn/start` / `assistant/message` / `turn/end` |
+| `{type:'end'}` / `{type:'error'}` | 流结束 |
+
+`sandbox`：`assistant/message` 里 `data.message.content` 是内容块数组，只取 `type==='text'`。
+**不要**再把 `assistant/chunk` 拼进来——两个都拼会让文本翻倍。
+
+### 4. 会话生命周期
+
+```
+workspace/create {path}            -> value.workspace.workspaceId
+session/create   {workspaceId}     -> value.sessionId
+session/prompt   {sessionId, mode:'queue', content:[{type:'text',text}]}
+workspace/archiveSession {sessionId}
+```
+
+## 还没做的（也是下一步）
+
+### 审批与提问
+
+`$events` 流里 `value.type==='waterfall'` 且 `value.event==='approval/request'` 或
+`'user-questions/request'`，要回 `POST /api/$events/result`：
+
+```json
+{ "args": { "request": { "clientId": "...", "eventId": "...", "outcome": "..." } } }
+```
+
+不回的话，agent 会一直等，桥这边表现为回合超时。这是接真业务前必须先补的。
+
+### 队列与退役
+
+换会话/重置前要清掉 DSH 侧还没跑的队列项（`session/projections` 的 `inbox` 投影 →
+`session/updateQueue` `{action:{kind:'remove'}}`），否则旧任务会继续烧 token。
+qq-bridge 在这里踩过 P0，`reference` 里那份代码的注释写得很清楚。
 
 ## 平台侧要点
 
-- 一条消息 = 一个回合，别把多条合并；合并会让 DSH 的审批和中断语义都乱掉。
-- 回复要转成纯文本（平台不支持 Markdown 时）；qq-bridge 的 `src/md-to-plain.js` 可以抄。
-- 长回复要分片，但别把代码块劈开。
-- 断线重连要做，但重连后不要把没发出去的消息重放一遍（会重复触发回合）。
-
-## 移植顺序
-
-1. 先让 console 适配器 + 假 DSH（返回固定字符串）跑通 → 验证事件循环。
-2. 接真 DSH，只做 `session/list` + `session/create`，确认 Cookie 能过。
-3. 做 `session/prompt` + mux 拼接文本。
-4. 最后做审批与中断。
-5. 再写平台适配器——它是唯一跟平台强相关、必须最后做的部分。
+- 一条消息 = 一个回合，别合并。
+- 回复转纯文本；长回复分片但别劈开代码块。
+- 断线重连后不要重放已发消息（会重复触发回合）。
