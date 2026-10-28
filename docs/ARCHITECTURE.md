@@ -82,20 +82,35 @@ session/prompt   {sessionId, mode:'queue', content:[{type:'text',text}]}
 workspace/archiveSession {sessionId}
 ```
 
-## 还没做的（也是下一步）
+## 审批与提问（已接）
 
-### 审批与提问
+`$events` 流和会话流开在同一条 mux 上：
 
-`$events` 流里 `value.type==='waterfall'` 且 `value.event==='approval/request'` 或
-`'user-questions/request'`，要回 `POST /api/$events/result`：
+- `value.type==='ready'` → 记下 `clientId`（答复时要带）
+- `value.type==='waterfall'` 且 `value.event==='approval/request'` → 审批
+- `value.type==='waterfall'` 且 `value.event==='user-questions/request'` → 提问
 
-```json
-{ "args": { "request": { "clientId": "...", "eventId": "...", "outcome": "..." } } }
+答复走一元 RPC：
+
+```
+POST /api/$events/result
+{ "args": { "clientId": "...", "eventId": "...", "outcome": { "kind": "result", "value": "allowed-once" } } }
 ```
 
-不回的话，agent 会一直等，桥这边表现为回合超时。这是接真业务前必须先补的。
+`outcome.value` 的形态：
 
-### 队列与退役
+| 场景 | value |
+|---|---|
+| 同意一次 | `"allowed-once"` |
+| 拒绝 | `"rejected"` |
+| 回答问题 | `{ "answers": [{ "id": "q1", "selected": [], "custom": "第一题的回答" }] }` |
+
+桥接这一层把它翻成聊天里的一句话（「【要审批】shell：要跑命令，回同意或拒绝」），
+下一条消息如果在等答复，就当作答复处理，而不是开新回合。
+
+注意：**流必须常驻**。审批事件出现的时刻，回合正卡着等答复；每回合开一条新流必然错过。
+
+## 队列与退役（还没做）
 
 换会话/重置前要清掉 DSH 侧还没跑的队列项（`session/projections` 的 `inbox` 投影 →
 `session/updateQueue` `{action:{kind:'remove'}}`），否则旧任务会继续烧 token。

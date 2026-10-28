@@ -10,6 +10,6 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node scripts/test-onebot.mjs && node scripts/test-cookie.mjs"
+    "test": "node scripts/test-onebot.mjs && node scripts/test-cookie.mjs && node scripts/test-approval.mjs"
   }
 }

@@ -30,6 +30,9 @@ export class ConsoleAdapter extends BaseAdapter {
         ctx: { channel: 'console' },
       });
     });
+
+    // stdin 关了（管道喂完）也当作收工，不然常驻事件流会把进程吊住
+    this.rl.on('close', () => this.emit('quit'));
     return this;
   }
 

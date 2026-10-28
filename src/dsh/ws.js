@@ -54,8 +54,8 @@ export class MiniWebSocket {
     socket.on('close', () => this.finish(1006, 'socket closed'));
 
     return new Promise((resolve, reject) => {
-      this.onOpen = resolve;
-      this.onError = reject;
+      this._resolveOpen = resolve;
+      this._rejectOpen = reject;
     });
   }
 
@@ -88,8 +88,11 @@ export class MiniWebSocket {
         return;
       }
       this.open = true;
+      // 先跑调用方的 onOpen（它可能要立刻发帧），再放行 connect() 的 promise
       this.onOpen?.();
       this.onOpen = null;
+      this._resolveOpen?.();
+      this._resolveOpen = null;
     }
 
     // 之后是帧
@@ -198,6 +201,9 @@ export class MiniWebSocket {
   }
 
   fail(err) {
+    this._rejectOpen?.(err);
+    this._rejectOpen = null;
+    this._resolveOpen = null;
     this.onError?.(err);
     this.finish(1006, err?.message ?? 'error');
   }

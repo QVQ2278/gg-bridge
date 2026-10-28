@@ -1,26 +1,21 @@
 /**
- * DSH 客户端：走 DSH Web API，把「一句话」变成一个回合，返回 agent 的回复文本。
+ * DSH 客户端：Cookie 鉴权 + 斜杠 RPC + 常驻 remote.mux。
  *
- * 协议要点（照 qq-bridge 的实测记录，不是猜的）：
+ * 为什么是「常驻」：审批和提问（`approval/request`、`user-questions/request`）只在
+ * `$events` 那条流上出现，而且出现的**时候**回合正卡着等答复。每回合开一条流就必然
+ * 错过它们，所以这里只开一条 mux，会话订阅按需加载、断线自动重连（重连后重放订阅）。
  *
- *  1. **鉴权是 Cookie**。Cookie 名 = `dsh-auth-` + base64url(sha256(authority))，
- *     值是 `v1.<payload>.<hmac>`，payload 里绑定 authority 与起止时间，用
- *     `~/.dsh/.credentials.yaml` 里持久化的 `client-connection/browser-session` 密钥
- *     （32 字节）做 HMAC-SHA256。这是纯本地计算，不需要进程启动 token。
- *
- *  2. **RPC 是 POST /api/<斜杠方法>**，信封是
- *     `{ type:'client-request', rpcId, method, payload:{ args:{...} } }`，
- *     回包是 `{ type:'server-response', rpcId, result:{ ok, value|error } }`。
- *     多数方法把参数包在 `args.request` 里，`session/list` 例外，用 `args._request`。
- *
- *  3. **事件流在 `/api/remote.mux`**（WebSocket）。先发
- *     `{type:'open', streamId, endpoint:'session/follow', payload:{args:{request:{address:{kind:'session',sessionId}}}}}`
- *     拿到开场快照，之后 `value.type === 'event'` 的帧就是回合事件：
- *     `turn/start` → `assistant/message`（完整文本，别叠加 `assistant/chunk`）→ `turn/end`。
+ * 协议要点（来自 qq-bridge 的实测记录，见 docs/ARCHITECTURE.md）：
+ *   · Cookie = 'dsh-auth-' + base64url(sha256(authority))，值 v1.<payload>.<hmac>，
+ *     密钥取自 ~/.dsh/.credentials.yaml 的 client-connection/browser-session（32 字节）
+ *   · POST /api/<斜杠方法>，信封 { type:'client-request', rpcId, method, payload:{args} }
+ *   · 回合事件：turn/start → assistant/message（只取 text 块）→ turn/end
+ *   · 审批答复：POST /api/$events/result { args:{ clientId, eventId, outcome } }
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { MiniWebSocket } from './ws.js';
 
@@ -29,6 +24,7 @@ const COOKIE_PREFIX = 'dsh-auth-';
 const COOKIE_PAYLOAD_VERSION = 1;
 const COOKIE_LIFETIME_MS = 60 * 60 * 1000;
 const SECRET_BYTES = 32;
+const RECONNECT_MAX_MS = 30_000;
 
 const base64url = (buf) => Buffer.from(buf).toString('base64')
   .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
@@ -37,12 +33,7 @@ export function resolveDshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 }
 
-/**
- * 从 `.credentials.yaml` 里挖出浏览器会话签名密钥。
- *
- * 只认那一条记录的 `secret:` 行——为这点东西引一个 YAML 依赖不值当，
- * 但解析失败必须**返回 null**（而不是抛），让调用方回退到显式 cookie。
- */
+/** 从 `.credentials.yaml` 挖出会话签名密钥；结构不符一律返回 null。 */
 export function readBrowserSessionSecret() {
   try {
     const file = path.join(resolveDshHome(), '.credentials.yaml');
@@ -58,12 +49,12 @@ export function readBrowserSessionSecret() {
       }
       if (!inBlock) continue;
       const first = line.match(/^(\s*)\S/);
-      if (first && first[1].length <= blockIndent) break; // 出块了
+      if (first && first[1].length <= blockIndent) break;
       const secret = line.match(/^\s*secret:\s*(\S+)\s*$/);
       if (!secret) continue;
       const raw = secret[1].replaceAll('-', '+').replaceAll('_', '/');
       const bytes = Buffer.from(raw, 'base64');
-      if (bytes.byteLength !== SECRET_BYTES) return null; // 密钥方案变了，别发坏 Cookie
+      if (bytes.byteLength !== SECRET_BYTES) return null;
       return bytes;
     }
     return null;
@@ -72,7 +63,7 @@ export function readBrowserSessionSecret() {
   }
 }
 
-/** 为一个具体地址铸造会话 Cookie。 */
+/** 为一个具体地址铸造会话 Cookie（authority 含端口）。 */
 export function mintBrowserSessionCookie(baseUrl, secret, { lifetimeMs = COOKIE_LIFETIME_MS } = {}) {
   const authority = new URL(String(baseUrl)).host;
   if (!authority) throw new Error('DSH baseUrl 里没有 authority');
@@ -88,7 +79,6 @@ export function mintBrowserSessionCookie(baseUrl, secret, { lifetimeMs = COOKIE_
   return `${name}=v1.${payload}.${signature}`;
 }
 
-/** 参数包装表：新协议把原 payload 塞进 `args.request`（session/list 是 `_request`）。 */
 const ARG_KEY = {
   'session/list': '_request',
   'session/create': 'request',
@@ -111,17 +101,27 @@ function wrapArgs(endpoint, payload) {
   return { args: { [key]: body } };
 }
 
-export class DshClient {
+export class DshClient extends EventEmitter {
   constructor(options = {}) {
+    super();
     this.baseUrl = options.baseUrl ?? 'http://127.0.0.1:3080';
     this.explicitCookie = options.cookie ?? '';
     this.workspacePath = options.workspacePath ?? process.cwd();
-    this.turnTimeoutMs = options.turnTimeoutMs ?? 180_000;
+    this.turnTimeoutMs = options.turnTimeoutMs ?? 300_000;
     this.logger = options.logger ?? console;
 
     this.cookie = '';
     this.workspaceId = null;
-    this.sessions = new Map(); // 会话键 -> sessionId
+    this.sessions = new Map();      // 会话键（qq:123456）-> sessionId
+    this.followed = new Set();      // 已订阅的 sessionId
+    this.pendingTurns = new Map();  // sessionId -> 正在等的回合
+    this.streams = new Map();       // streamId -> { kind, sessionId }
+
+    this.ws = null;
+    this.eventClientId = null;
+    this.eventStreamId = null;
+    this.closing = false;
+    this.reconnectDelay = 1_000;
   }
 
   get muxUrl() {
@@ -130,7 +130,6 @@ export class DshClient {
     return url.toString();
   }
 
-  /** 拿一个能用的 Cookie：先看显式配置，再尝试本地铸造。 */
   ensureCookie() {
     if (this.cookie) return this.cookie;
     if (this.explicitCookie) {
@@ -148,7 +147,6 @@ export class DshClient {
     return this.cookie;
   }
 
-  /** 发一个一元 RPC。 */
   async callUnary(method, payload = {}, { timeoutMs = 30_000 } = {}) {
     const endpoint = method.replaceAll('.', '/');
     const envelope = {
@@ -164,7 +162,7 @@ export class DshClient {
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (res.status === 401) {
-      this.cookie = ''; // Cookie 过期/被 DSH 重启作废，下次调用重新铸造
+      this.cookie = '';
       throw new Error(`${endpoint}: HTTP 401（Cookie 失效）`);
     }
     if (!res.ok) throw new Error(`${endpoint}: HTTP ${res.status}`);
@@ -179,7 +177,188 @@ export class DshClient {
     return full.result.value;
   }
 
-  /** 建（或复用）一个工作区，会话都挂在它下面。 */
+  // ── 常驻事件流 ────────────────────────────────────────────
+
+  /** 连上 remote.mux，开 `$events` 和所有已订阅会话。断线自动重连。 */
+  async start() {
+    this.closing = false;
+    await this.openMux();
+    return this;
+  }
+
+  openMux() {
+    return new Promise((resolve, reject) => {
+      const ws = new MiniWebSocket(this.muxUrl, { headers: { cookie: this.ensureCookie() } });
+      this.ws = ws;
+
+      let settled = false;
+      ws.onOpen = () => {
+        this.reconnectDelay = 1_000;
+        this.openEventStream();
+        for (const sessionId of this.followed) this.sendFollow(sessionId);
+        if (!settled) {
+          settled = true;
+          resolve(this);
+        }
+      };
+      ws.onMessage = (data) => this.onMuxFrame(data);
+      ws.onClose = () => {
+        this.ws = null;
+        this.eventClientId = null;
+        this.eventStreamId = null;
+        this.streams.clear();
+        if (!settled) {
+          settled = true;
+          reject(new Error('连不上 DSH 事件流'));
+        }
+        if (!this.closing) this.scheduleReconnect();
+      };
+      ws.onError = (err) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      };
+
+      ws.connect().catch((err) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      });
+    });
+  }
+
+  scheduleReconnect() {
+    const delay = this.reconnectDelay;
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
+    this.logger.warn?.(`[dsh] ${delay}ms 后重连事件流`);
+    setTimeout(() => {
+      if (!this.closing) this.openMux().catch((err) => this.logger.warn?.('[dsh] 重连失败：', err.message));
+    }, delay);
+  }
+
+  openEventStream() {
+    if (!this.ws) return;
+    const streamId = randomUUID();
+    this.eventStreamId = streamId;
+    this.streams.set(streamId, { kind: 'events' });
+    this.ws.send(JSON.stringify({
+      type: 'open',
+      streamId,
+      endpoint: '$events',
+      payload: { args: {} },
+    }));
+  }
+
+  sendFollow(sessionId) {
+    if (!this.ws) return;
+    const streamId = randomUUID();
+    this.streams.set(streamId, { kind: 'session', sessionId });
+    this.ws.send(JSON.stringify({
+      type: 'open',
+      streamId,
+      endpoint: 'session/follow',
+      payload: {
+        args: { request: { address: { kind: 'session', sessionId }, maxMessages: 1 } },
+      },
+    }));
+  }
+
+  follow(sessionId) {
+    if (this.followed.has(sessionId)) return;
+    this.followed.add(sessionId);
+    this.sendFollow(sessionId);
+  }
+
+  onMuxFrame(data) {
+    let frame;
+    try {
+      frame = JSON.parse(typeof data === 'string' ? data : data.toString());
+    } catch {
+      return;
+    }
+    const stream = this.streams.get(frame.streamId);
+    if (!stream) return;
+
+    if (frame.type === 'end' || frame.type === 'error') {
+      if (stream.kind === 'events') {
+        this.eventStreamId = null;
+      } else if (stream.kind === 'session' && this.followed.has(stream.sessionId)) {
+        // 服务端回收了这条会话流：2 秒后重新订阅，否则这个会话永久静默
+        setTimeout(() => { if (!this.closing && this.followed.has(stream.sessionId)) this.sendFollow(stream.sessionId); }, 2000);
+      }
+      this.streams.delete(frame.streamId);
+      return;
+    }
+    if (frame.type !== 'item') return;
+
+    const value = frame.value;
+    if (stream.kind === 'events') {
+      this.onEventFrame(value);
+      return;
+    }
+    if (value?.type === 'event') this.onSessionEvent(stream.sessionId, value.event);
+  }
+
+  /** `$events` 流：ready 给 clientId，waterfall 里是审批/提问。 */
+  onEventFrame(value) {
+    if (!value) return;
+    if (value.type === 'ready') {
+      this.eventClientId = value.clientId;
+      this.emit('ready', { clientId: value.clientId });
+      return;
+    }
+    if (value.type !== 'waterfall') return;
+
+    if (value.event === 'approval/request') {
+      this.emit('approval', {
+        sessionId: value.agentId,
+        clientId: this.eventClientId,
+        eventId: value.eventId,
+        toolName: value.request?.toolName,
+        callId: value.request?.callId,
+        reason: value.request?.reason,
+      });
+      return;
+    }
+    if (value.event === 'user-questions/request') {
+      this.emit('question', {
+        sessionId: value.agentId,
+        clientId: this.eventClientId,
+        eventId: value.eventId,
+        questions: value.request?.questions ?? [],
+      });
+    }
+  }
+
+  onSessionEvent(sessionId, event) {
+    if (!event) return;
+    const turn = this.pendingTurns.get(sessionId);
+    if (!turn) return;
+
+    turn.touch();
+
+    if (event.type === 'turn/start') {
+      turn.turnId = event.data?.turn;
+      return;
+    }
+    if (event.type === 'assistant/message') {
+      if (turn.turnId != null && event.data?.turn !== turn.turnId) return;
+      for (const block of event.data?.message?.content ?? []) {
+        if (block?.type === 'text' && typeof block.text === 'string') turn.text += block.text;
+      }
+      return;
+    }
+    if (event.type === 'turn/end') {
+      if (turn.turnId != null && event.data?.turn !== turn.turnId) return;
+      this.pendingTurns.delete(sessionId);
+      turn.resolve({ text: turn.text.trim(), reason: event.data?.reason ?? 'end' });
+    }
+  }
+
+  // ── 会话与回合 ────────────────────────────────────────────
+
   async ensureWorkspace() {
     if (this.workspaceId) return this.workspaceId;
     const value = await this.callUnary('workspace/create', { path: this.workspacePath });
@@ -188,7 +367,6 @@ export class DshClient {
     return this.workspaceId;
   }
 
-  /** 一个聊天会话对应一个 DSH 会话，按 ctx 缓存。 */
   async ensureSession(key) {
     const cached = this.sessions.get(key);
     if (cached) return cached;
@@ -200,141 +378,65 @@ export class DshClient {
     return sessionId;
   }
 
-  /**
-   * 跑一个回合：开 mux → 订阅该会话 → 发 prompt → 收事件收到 turn/end。
-   * @returns {Promise<{text: string, reason: string}>}
-   */
-  async runTurn(sessionId, text) {
-    const ws = new MiniWebSocket(this.muxUrl, { headers: { cookie: this.ensureCookie() } });
-    const streamId = randomUUID();
+  /** 跑一个回合，等到 turn/end 返回最终文本。审批会挂起，直到 approve() 答复。 */
+  async prompt(ctx, text) {
+    if (!this.ws) await this.start();
+    const key = `${ctx?.type ?? 'console'}:${ctx?.groupId ?? ctx?.userId ?? 'local'}`;
+    const sessionId = await this.ensureSession(key);
+    this.follow(sessionId);
 
-    await ws.connect();
+    if (this.pendingTurns.has(sessionId)) throw new Error('这个会话上一回合还没结束');
 
-    return new Promise((resolve, reject) => {
-      let snapshotSeen = false;
-      let prompted = false;
-      let finished = false;
-      let turnText = '';
-      let currentTurn = null;
-
+    const result = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        cleanup();
+        this.pendingTurns.delete(sessionId);
         reject(new Error('回合超时'));
       }, this.turnTimeoutMs);
 
-      const cleanup = () => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        try { ws.close(1000); } catch { /* 已经关了 */ }
+      const turn = {
+        text: '',
+        turnId: null,
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+        touch: () => { timer.refresh?.(); },
       };
+      this.pendingTurns.set(sessionId, turn);
 
-      const sendPrompt = () => {
-        if (prompted) return;
-        prompted = true;
-        this.callUnary('session/prompt', {
-          sessionId,
-          mode: 'queue',
-          content: [{ type: 'text', text }],
-        }).catch((err) => {
-          cleanup();
-          reject(err);
-        });
-      };
-
-      ws.onMessage = (data) => {
-        let frame;
-        try {
-          frame = JSON.parse(typeof data === 'string' ? data : data.toString());
-        } catch {
-          return;
-        }
-        if (frame.streamId !== streamId) return;
-
-        if (frame.type === 'error') {
-          cleanup();
-          reject(new Error(`事件流报错：${frame.error?.code ?? 'unknown'}`));
-          return;
-        }
-        if (frame.type === 'end') {
-          cleanup();
-          if (turnText) resolve({ text: turnText, reason: 'stream-end' });
-          else reject(new Error('事件流结束但没收到回复'));
-          return;
-        }
-        if (frame.type !== 'item') return;
-
-        const value = frame.value;
-        if (value?.type === 'snapshot') {
-          // 开场快照里可能有历史回合的 turn/end，绝不能当成新回合
-          if (!snapshotSeen) {
-            snapshotSeen = true;
-            sendPrompt();
-          }
-          return;
-        }
-        if (value?.type !== 'event') return;
-
-        const event = value.event;
-        if (event?.type === 'turn/start') {
-          if (!prompted) sendPrompt(); // 兜底：没等到快照就先跑起来了
-          currentTurn = event.data?.turn;
-          return;
-        }
-        if (event?.type === 'assistant/message') {
-          if (currentTurn !== null && event.data?.turn !== currentTurn) return;
-          for (const block of event.data?.message?.content ?? []) {
-            if (block?.type === 'text' && typeof block.text === 'string') turnText += block.text;
-          }
-          return;
-        }
-        if (event?.type === 'turn/end') {
-          if (currentTurn !== null && event.data?.turn !== currentTurn) return;
-          cleanup();
-          resolve({ text: turnText.trim(), reason: event.data?.reason ?? 'end' });
-        }
-      };
-
-      ws.onClose = () => {
-        if (finished) return;
-        clearTimeout(timer);
-        if (turnText) resolve({ text: turnText.trim(), reason: 'closed' });
-        else reject(new Error('事件流提前关闭'));
-      };
-
-      ws.onError = (err) => {
-        cleanup();
-        reject(err);
-      };
-
-      ws.send(JSON.stringify({
-        type: 'open',
-        streamId,
-        endpoint: 'session/follow',
-        payload: {
-          args: {
-            request: {
-              address: { kind: 'session', sessionId },
-              maxMessages: 1,
-            },
-          },
-        },
-      }));
-
-      // 万一 DSH 不发快照，别把回合卡死
-      setTimeout(() => { if (!finished) sendPrompt(); }, 3_000);
+      this.callUnary('session/prompt', {
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text }],
+      }).catch((err) => {
+        this.pendingTurns.delete(sessionId);
+        turn.reject(err);
+      });
     });
-  }
 
-  /** 桥接对外只有这一个方法：一句话进，一段话出。 */
-  async prompt(ctx, text) {
-    const key = `${ctx?.type ?? 'console'}:${ctx?.groupId ?? ctx?.userId ?? 'local'}`;
-    const sessionId = await this.ensureSession(key);
-    const result = await this.runTurn(sessionId, text);
     return result.text;
   }
 
+  /** 回答挂起的审批。value: 'allowed-once' | 'rejected'。 */
+  async approve({ clientId, eventId }, value) {
+    return this.respondEvent(clientId, eventId, { kind: 'result', value });
+  }
+
+  /** 回答挂起的提问（每题的 selected / custom 都留空即「跳过」）。 */
+  async answer({ clientId, eventId, questions }, answers) {
+    return this.respondEvent(clientId, eventId, {
+      kind: 'result',
+      value: { answers: answers ?? (questions ?? []).map((q) => ({ id: q.id, selected: [], custom: '' })) },
+    });
+  }
+
+  async respondEvent(clientId, eventId, outcome) {
+    return this.callUnary('$events/result', { clientId, eventId, outcome });
+  }
+
   async close() {
-    this.sessions.clear();
+    this.closing = true;
+    for (const [, turn] of this.pendingTurns) turn.reject(new Error('客户端关闭'));
+    this.pendingTurns.clear();
+    this.ws?.close(1000);
+    this.ws = null;
   }
 }
