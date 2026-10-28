@@ -1,0 +1,14 @@
+{
+  "name": "gg-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "license": "MIT",
+  "description": "Bridge between a chat platform and DeepSeek Harness: platform messages become DSH turns, agent replies go back.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  }
+}
