@@ -122,7 +122,10 @@ async function main() {
     }
 
     try {
+      const started = Date.now();
+      console.log(`[${key}] ← ${text.slice(0, 60)}`);
       const reply = await dsh.prompt(ctx, text);
+      console.log(`[${key}] → ${(reply ?? '').slice(0, 60)} (${Date.now() - started}ms)`);
       if (reply) await adapter.send(ctx, reply);
       else await adapter.send(ctx, '（这回合没说话）');
     } catch (err) {
