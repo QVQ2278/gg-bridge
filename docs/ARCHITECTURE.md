@@ -16,7 +16,7 @@
 |---|---|---|
 | `src/adapters/base.js` | 接口已定 | 不用改 |
 | `src/adapters/console.js` | 可跑 | 拿它验证链路 |
-| `src/adapters/<平台>.js` | 缺 | 实现 connect / send，收到消息 emit('message') |
+| `src/adapters/onebot.js` | 可跑 | QQ / OneBot v11，接 NapCat 之类 |
 | `src/dsh/client.js` | 只有签名 | 移植鉴权 + RPC + 事件流 |
 
 ## DSH 侧要点（照 qq-bridge 抄，别自己发明）

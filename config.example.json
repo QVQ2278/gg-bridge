@@ -1,6 +1,10 @@
 {
   "adapter": {
-    "type": "console"
+    "type": "onebot",
+    "url": "ws://127.0.0.1:3001",
+    "accessToken": "",
+    "groupReply": "mention",
+    "prefixes": ["gg"]
   },
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",

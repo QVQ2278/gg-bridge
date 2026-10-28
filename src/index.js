@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ConsoleAdapter } from './adapters/console.js';
+import { OneBotAdapter } from './adapters/onebot.js';
 import { DshClient } from './dsh/client.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -23,7 +24,8 @@ function loadConfig() {
 
 const ADAPTERS = {
   console: ConsoleAdapter,
-  // 接新平台时在这里登记：telegram: TelegramAdapter, ...
+  onebot: OneBotAdapter, // QQ，走 OneBot v11 正向 WebSocket
+  // 再接新平台时在这里登记：telegram: TelegramAdapter, ...
 };
 
 function createAdapter(type, options) {

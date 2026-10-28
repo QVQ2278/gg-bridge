@@ -9,6 +9,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node scripts/test-onebot.mjs"
   }
 }

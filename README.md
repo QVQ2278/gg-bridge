@@ -1,46 +1,68 @@
 # gg-bridge
 
-把某个聊天平台接到 **DeepSeek Harness**（下称 DSH）的桥。消息进 DSH 变成一个回合，DSH 的回复再发回去。
+把 **QQ** 接到 **DeepSeek Harness**（下称 DSH）的桥。QQ 消息进 DSH 变成一个回合，agent 的回复再发回 QQ。
 
-> 现在这份是**骨架**：通信两端都留了明确的插槽，其中 console 适配器是能直接跑的，DSH 客户端还是 TODO。
-> `docs/ARCHITECTURE.md` 写了每个槽位该填什么，以及 `qq-bridge` 里可以直接照抄的那部分。
+QQ 这一侧走 **OneBot v11 正向 WebSocket**，NapCat / Lagrange / SnowLuma 都能用，不绑某一个实现。
+DSH 这一侧还没填（见下）。
 
-## 为什么是骨架
+## 现在能跑到哪一步
 
-DSH 那一侧的协议不简单，照抄比重新发明省事：
+| 部分 | 状态 |
+|---|---|
+| QQ 适配器（OneBot v11） | ✅ 连、收、发、重连、群里只接 @ / 前缀 |
+| console 适配器 | ✅ 终端里测链路用 |
+| DSH 客户端 | ❌ 只有签名，`src/dsh/client.js` 顶部写了要抄什么 |
 
-- 鉴权是 Cookie，不是 Bearer。Cookie 由 `~/.dsh` 里持久化的 `client-connection/browser-session`
-  密钥做 HMAC 离线铸造，所以**不用**去扒进程启动 token。
-- RPC 方法名是斜杠形式（`session/list`、`session/prompt`），payload 包在 `{ args: {...} }` 里。
-- 事件流是 `/api/remote.mux` 上按 `session/follow` 打开的流，提问/审批走同一条 mux 上的
-  `$events` 与 `$events/result`。
-
-这三件事 `qq-bridge/src/dsh-client.js` 已经踩平了，本仓库的 `src/dsh/client.js` 就是给它留的位置。
-
-## 跑起来
+拿 console 就能把整条链路跑起来：
 
 ```bash
-npm install     # 目前没有依赖，纯 node 内置模块
-npm start       # 启动 console 适配器，在终端里跟 DSH 对话
+npm start          # 读 config.json，没有就读 config.example.json
+npm test           # OneBot 解析/触发逻辑的纯函数测试
 ```
 
-没有 `config.json` 时会读 `config.example.json`。
+## 配置
+
+`config.example.json` → 复制成 `config.json` 再改：
+
+```json
+{
+  "adapter": {
+    "type": "onebot",
+    "url": "ws://127.0.0.1:3001",
+    "accessToken": "",
+    "groupReply": "mention",
+    "prefixes": ["gg"]
+  },
+  "dsh": { "baseUrl": "http://127.0.0.1:3080", "cookie": "", "sessionId": "" }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `url` | OneBot 的 WebSocket 地址。NapCat 默认 `ws://127.0.0.1:3001` |
+| `accessToken` | OneBot 端配了 token 才填，会拼成 `?access_token=` |
+| `groupReply` | 群里怎么才回：`mention`（被 @ 才回）/ `prefix`（带前缀才回）/ `always`（全回） |
+| `prefixes` | `groupReply=prefix` 时的触发词，匹配后会被剥掉再送进 DSH |
+
+私聊永远回。自己在群里说的话不会被当成消息接回来。
 
 ## 目录
 
 ```
-src/index.js            入口：读配置、装适配器、把两边接起来
-src/adapters/base.js    适配器接口（connect / send / onMessage）
-src/adapters/console.js 终端适配器，当前唯一能跑的
-src/dsh/client.js       DSH 客户端插槽（TODO：照 qq-bridge 移植）
-docs/ARCHITECTURE.md    槽位说明、协议要点、移植清单
+src/index.js             入口：读配置、装适配器、把两边接起来
+src/adapters/base.js     适配器接口（connect / send / 事件）
+src/adapters/onebot.js   QQ，OneBot v11 正向 WebSocket
+src/adapters/console.js  终端，测链路用
+src/dsh/client.js        DSH 客户端插槽（TODO）
+scripts/test-onebot.mjs  纯函数测试
+docs/ARCHITECTURE.md     槽位说明、DSH 协议要点、移植清单
 ```
 
-## 下一步
+## 下一步：DSH 那一侧
 
-1. 定平台：`gg` 接的是哪个端（QQ？某个群里？别的软件？）。
-2. 按那个端写一个 `src/adapters/<name>.js`，实现 `base.js` 的四个方法。
-3. 把 `src/dsh/client.js` 的方法填上，参考 `qq-bridge/src/dsh-client.js`。
+协议有三处坑，`docs/ARCHITECTURE.md` 和 `src/dsh/client.js` 里都写清楚了：
+Cookie 鉴权（不是 Bearer）、斜杠 RPC、`/api/remote.mux` 事件流。
+`qq-bridge/src/dsh-client.js` 已经踩平过，移植时只抄鉴权和 RPC 通道，别抄业务。
 
 ## License
 
